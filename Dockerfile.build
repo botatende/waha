@@ -15,6 +15,11 @@ COPY package.json /app/package.json
 # headless: false (VNC display)
 RUN sed -i "s/headless: true/headless: false/g" /app/dist/core/engines/webjs/session.webjs.core.js || true
 
+# Fix whatsapp-web.js Client.js: launchUtils.refreshQR() com fallback condicional
+# (nunca Cmd.refreshQR sem verificar). Versionado em image/patch-wwjs-client.js.
+COPY image/patch-wwjs-client.js /app/image/patch-wwjs-client.js
+RUN node /app/image/patch-wwjs-client.js
+
 # wa-connect service + entrypoint (VNC pool)
 RUN mkdir -p /app/wa-connect
 COPY image/wa-connect/ /app/wa-connect/
