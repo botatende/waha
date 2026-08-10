@@ -213,6 +213,12 @@ export class ClientSessionConfig {
   @IsString()
   @IsOptional()
   browserName?: string;
+
+  // Display X (ex.: ":20") para rotear o Chromium do WAHA ao slot VNC correto.
+  // Precisava estar no DTO (whitelist removia o campo desconhecido no update).
+  @IsString()
+  @IsOptional()
+  display?: string;
 }
 
 export class SessionConfig {
