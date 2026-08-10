@@ -631,6 +631,9 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
           await sleep(3_000);
         }
       }
+      // Reconnect/restart com auth persistida (PostgreSQL): NAO ha evento QR.
+      // Garante a aba Google idempotente apos autenticacao (reusa se ja existe).
+      this.openGoogleAuxTab().catch(() => {});
     });
 
     this.whatsapp.on(Events.AUTHENTICATION_FAILURE, (args) => {

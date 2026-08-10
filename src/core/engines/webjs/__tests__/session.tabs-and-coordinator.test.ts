@@ -149,6 +149,56 @@ describe('QR — estado do ciclo de vida (inicial / expirado / reconexão)', () 
   });
 });
 
+describe('Reconnect com auth persistida (SEM evento QR) → 1 WhatsApp + 1 Google', () => {
+  it('AUTHENTICATED/READY dispara openGoogleAuxTab idempotente sem depender de QR', async () => {
+    // Reconnect: pagina WhatsApp ja autenticada, SEM evento QR. O gatilho
+    // correto e AUTHENTICATED/READY (nao QR_RECEIVED). Abre a Google mesmo
+    // assim, em background, idempotente.
+    let newPageCount = 0;
+    let pages: any[] = [{ url: () => 'https://web.whatsapp.com/', authed: true }];
+    const browser = {
+      pages: async () => pages,
+      newPage: jest.fn(async () => {
+        newPageCount++;
+        const gp = { url: () => 'https://accounts.google.com/', goto: jest.fn(async () => {}) };
+        pages = [...pages, gp];
+        return gp;
+      }),
+    };
+    // 1) reconnect sem QR -> abre a Google
+    await openGoogleTabInBackground(browser as any, 'https://accounts.google.com/');
+    expect(newPageCount).toBe(1);
+    expect(pages.some((p) => p.url().includes('whatsapp'))).toBe(true);
+    expect(pages.some((p) => p.url().includes('google'))).toBe(true);
+    // 2) novo reconnect -> idempotente, reusa a Google
+    await openGoogleTabInBackground(browser as any, 'https://accounts.google.com/');
+    expect(newPageCount).toBe(1);
+    // 3) nunca duplica nem fecha a página WhatsApp
+    expect(pages.filter((p) => p.url().includes('whatsapp'))).toHaveLength(1);
+    expect(pages.filter((p) => p.url().includes('google'))).toHaveLength(1);
+  });
+
+  it('com auth + QR_RECEIVED (logout real) tambem garante 1 WA + 1 Google', async () => {
+    let newPageCount = 0;
+    let pages: any[] = [{ url: () => 'https://web.whatsapp.com/' }];
+    const browser = {
+      pages: async () => pages,
+      newPage: jest.fn(async () => {
+        newPageCount++;
+        const gp = { url: () => 'https://accounts.google.com/', goto: jest.fn(async () => {}) };
+        pages = [...pages, gp];
+        return gp;
+      }),
+    };
+    // gateways QR_RECEIVED e AUTHENTICATED ambos chamam o helper idempotente
+    await openGoogleTabInBackground(browser as any, 'https://accounts.google.com/');
+    await openGoogleTabInBackground(browser as any, 'https://accounts.google.com/');
+    expect(newPageCount).toBe(1);
+    expect(pages.filter((p) => p.url().includes('whatsapp'))).toHaveLength(1);
+    expect(pages.filter((p) => p.url().includes('google'))).toHaveLength(1);
+  });
+});
+
 describe('SessionOpCoordinator (psql) — serialização + close-once', () => {
   it('serializa ops por sessão (fila única, sem deadlock)', async () => {
     const order: string[] = [];
