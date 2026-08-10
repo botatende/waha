@@ -231,9 +231,22 @@ export class RemoteAuth implements AuthStrategy {
   }
 
   async destroy() {
-    // Reconnect/stop->start: NAO fecha o pool PostgreSQL (regra 1/3).
-    // Apenas para o backup-sync; o pool vive pela sessão.
+    // Reconnect/stop->start/restart: NAO fecha o pool PostgreSQL (regra 1/3) e
+    // NUNCA apaga a auth. Executa um FLUSH FINAL (backup pendente + drain) com
+    // timeout curto (menor que o grace period do SIGTERM) para garantir que o
+    // ultimo backup gravado persista antes de o processo encerrar.
     this.backupSyncRunner.stop();
+    try {
+      // Se o backup inicial ainda nao concluiu/confirmou, forca um flush agora.
+      const FLUSH_TIMEOUT_MS = 10000; // < grace period (SIGTERM)
+      await Promise.race([
+        this.ensureInitialBackup().catch(() => false),
+        new Promise((r) => setTimeout(r, FLUSH_TIMEOUT_MS)),
+      ]);
+      await this.drainRepositoryOperations();
+    } catch (e) {
+      this.logger.warn(`RemoteAuth.destroy flush falhou: ${(e as Error).message}`);
+    }
   }
 
   async disconnect() {
@@ -241,16 +254,65 @@ export class RemoteAuth implements AuthStrategy {
     await this.deleteLocalSession();
   }
 
-  async afterAuthReady() {
-    const sessionExists = await this.store.sessionExists({
-      session: this.sessionName,
-    });
-    if (!sessionExists) {
-      /* Initial delay sync required for session to be stable enough to recover */
-      await sleep(this.INITIAL_DELAY_MS);
-      await this.storeRemoteSession();
-      this.client.emit(Events.REMOTE_SESSION_SAVED);
+  private initialBackupPromise: Promise<boolean> | null = null;
+  private initialBackupAttempt = 0;
+
+  /**
+   * Backup inicial: single-flight e idempotente (apenas UMA gravacao concorrente).
+   * afterAuthReady, AUTHENTICATED e READY podem chamar; a primeira gravacao vence.
+   * - Remove o delay de 60s do primeiro backup (restart precoce perdia a sessao).
+   * - Marca "auth persistida" SOMENTE apos storeRemoteSession() concluir E o
+   *   arquivo existir no PostgreSQL.
+   * - Em falha: mantem a sessao conectada e faz retry com backoff; NAO marca
+   *   a sessao como persistida.
+   */
+  async ensureInitialBackup(): Promise<boolean> {
+    if (this.initialBackupPromise) {
+      return this.initialBackupPromise;
     }
+    this.initialBackupPromise = (async () => {
+      // Retry com backoff exponencial, com LIMITE para nao travar o shutdown.
+      // O runner periodico (60s) continua tentando depois; aqui nao fica em
+      // loop infinito que seguraria SIGTERM/flush.
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        this.initialBackupAttempt = attempt;
+        try {
+          await this.storeRemoteSession();
+          const exists = await this.store.sessionExists({
+            session: this.sessionName,
+          });
+          if (exists) {
+            this.logger.info(
+              `RemoteAuth: auth persistida confirmada (backup #${this.initialBackupAttempt})`,
+            );
+            return true;
+          }
+          this.logger.error(
+            `RemoteAuth: backup concluido mas arquivo NAO existe no store (tentativa #${this.initialBackupAttempt})`,
+          );
+        } catch (e) {
+          this.logger.error(
+            `RemoteAuth: backup inicial falhou (tentativa #${this.initialBackupAttempt}): ${(e as Error).message}`,
+          );
+        }
+        if (attempt < MAX_ATTEMPTS) {
+          const backoff = Math.min(2000 * Math.pow(2, attempt - 1), 30000);
+          await sleep(backoff);
+        }
+      }
+      this.logger.error(
+        `RemoteAuth: backup inicial nao confirmado apos ${MAX_ATTEMPTS} tentativas (runner 60s continuara)`,
+      );
+      return false;
+    })();
+    return this.initialBackupPromise;
+  }
+
+  async afterAuthReady() {
+    // Backup imediato (sem delay de 60s) — single-flight, aguarda conclusao.
+    await this.ensureInitialBackup();
+    this.client.emit(Events.REMOTE_SESSION_SAVED);
 
     this.backupSyncRunner.start(async () => {
       await this.storeRemoteSession();
