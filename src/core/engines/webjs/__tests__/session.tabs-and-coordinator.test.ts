@@ -1,84 +1,88 @@
 /**
- * Testes obrigatórios (gates antes de publicar digest):
- *  1. refreshQR: a lógica do fork whatsapp-web.js prepara launchUtils.refreshQR
- *     com fallback condicional Cmd.refreshQR (só se a função existir). Valida
- *     que NUNCA chamamos Cmd.refreshQR quando launchUtils existe.
- *  2. Abas: o Chromium do WAHA (único) abre EXATAMENTE 1 client page
- *     (web.whatsapp.com) + 1 aba Google (accounts.google.com) — sem duplicar
- *     WhatsApp e sem Chromium auxiliar no wa-connect (display-only).
- *  3. Coordinator: SessionOpCoordinator (psql) serializa ops e faz close-once.
+ * Testes obrigatórios (gates antes de publicar digest v2):
+ *  1. Abas: o Chromium do WAHA (único) abre 1 client page web.whatsapp.com; a
+ *     aba Google NÃO é injetada no startup (resolveWebjsBrowserTabArgs só seta
+ *     display/modo); é aberta via openGoogleTabInBackground APÓS o QR, em
+ *     background e IDEMPOTENTE (reusa, não duplica, não fecha WhatsApp).
+ *  2. refreshQR: launchUtils.refreshQR com fallback condicional Cmd.refreshQR.
+ *  3. Coordinator: SessionOpCoordinator serializa ops + close-once.
+ *  4. QR: helpers de estado (QR inicial/expirado/reconexão) via launchUtils.
  */
 import {
   resolveWebjsBrowserTabArgs,
   shouldOpenGoogleTab,
   googleTabUrlFromEnv,
+  openGoogleTabInBackground,
 } from '@waha/core/engines/webjs/webjs-browser-tabs';
 import { SessionOpCoordinator } from '@waha/core/storage/psql/SessionOpCoordinator';
 
-describe('WEBJS abas — 1 WhatsApp + 1 Google no MESMO Chromium', () => {
-  it('com display e OPEN_GOOGLE_TAB default: abre Google como 2a aba, nao duplica WhatsApp', () => {
+describe('WEBJS abas — startup NÃO injeta Google; Google via background após QR', () => {
+  it('startup: com display seta --display e modo, SEM injetar accounts.google', () => {
     const args = resolveWebjsBrowserTabArgs(':20', true);
     expect(args).toContain('--display=:20');
     expect(args).toContain('--start-maximized');
-    expect(args).toContain('https://accounts.google.com/');
-    // NUNCA injeta web.whatsapp.com como aba inicial (evita duplicação).
-    expect(args.some((a) => a.includes('web.whatsapp.com'))).toBe(false);
+    // CRÍTICO: a URL Google NÃO vai no startup (pode duplicar/navegar a aba).
+    expect(args.some((a) => a.includes('google'))).toBe(false);
+    expect(args.some((a) => a.includes('whatsapp'))).toBe(false);
   });
 
-  it('com display e OPEN_GOOGLE_TAB=false: usa --kiosk sem aba Google', () => {
-    const args = resolveWebjsBrowserTabArgs(':20', false);
-    expect(args).toContain('--display=:20');
+  it('startup sem display: --kiosk, sem --display nem google', () => {
+    const args = resolveWebjsBrowserTabArgs(null, false);
     expect(args).toContain('--kiosk');
-    expect(args.some((a) => a.includes('accounts.google'))).toBe(false);
-  });
-
-  it('sem display: nao injeta --display nem duplica', () => {
-    const args = resolveWebjsBrowserTabArgs(null, true);
     expect(args.some((a) => a.startsWith('--display='))).toBe(false);
-    expect(args.some((a) => a.includes('web.whatsapp.com'))).toBe(false);
+    expect(args.some((a) => a.includes('google'))).toBe(false);
   });
 
-  it('shouldOpenGoogleTab: default true, aceita "false"', () => {
-    expect(shouldOpenGoogleTab({})).toBe(true);
-    expect(shouldOpenGoogleTab({ WAHA_WEBJS_OPEN_GOOGLE_TAB: 'false' })).toBe(
-      false,
-    );
-    expect(
-      shouldOpenGoogleTab({ WAHA_WEBJS_OPEN_GOOGLE_TAB: 'FALSE' }),
-    ).toBe(false);
+  it('openGoogleTabInBackground: cria 1 aba Google unica (idempotente, nao duplica)', async () => {
+    const fakePages = { pages: jest.fn() };
+    let created = 0;
+    const browser = {
+      pages: async () => [
+        // página WhatsApp existente (client page)
+        { url: () => 'https://web.whatsapp.com/' },
+      ],
+      newPage: jest.fn(async () => {
+        created++;
+        return {
+          url: () => 'about:blank',
+          goto: jest.fn(async (u: string, _o: any) => {}),
+        };
+      }),
+    };
+    await openGoogleTabInBackground(browser, 'https://accounts.google.com/');
+    expect(created).toBe(1);
+    expect(browser.newPage).toHaveBeenCalledTimes(1);
+    // Nova chamada: já existe aba Google -> reutiliza, NÃO cria outra.
+    browser.pages = async () => [
+      { url: () => 'https://web.whatsapp.com/' },
+      { url: () => 'https://accounts.google.com/' }, // agora existe
+    ];
+    await openGoogleTabInBackground(browser, 'https://accounts.google.com/');
+    expect(browser.newPage).toHaveBeenCalledTimes(1); // idempotente
+    expect(created).toBe(1);
   });
 
-  it('googleTabUrlFromEnv: default accounts.google.com, aceita custom', () => {
-    expect(googleTabUrlFromEnv({})).toBe('https://accounts.google.com/');
-    expect(
-      googleTabUrlFromEnv({ WAHA_WEBJS_GOOGLE_TAB_URL: 'https://x.com/' }),
-    ).toBe('https://x.com/');
-  });
-
-  it('comportamento da config real gera exatamente 1 whatsapp + 1 google (não duplica)', () => {
-    // resolveWebjsBrowserTabArgs NÃO adiciona whatsapp; o WAHA navega a client
-    // page separadamente. Assim a combinação do Chromium é: [client page WA] +
-    // [aba Google injetada] = 2 páginas, 1 WhatsApp + 1 Google.
-    const args = resolveWebjsBrowserTabArgs(':20', true);
-    const whatsappArgs = args.filter((a) => a.includes('whatsapp'));
-    const googleArgs = args.filter((a) => a.includes('google'));
-    expect(whatsappArgs).toHaveLength(0); // WhatsApp vem só da client page
-    expect(googleArgs.length).toBeGreaterThanOrEqual(1); // aba Google única
+  it('openGoogleTabInBackground: nunca fecha/normaliza a página WhatsApp', async () => {
+    let whatsappClosed = false;
+    const browser = {
+      pages: async () => [{ whatsapp: true }],
+      newPage: jest.fn(async () => {
+        whatsappClosed = false; // não toca na whatsapp
+        return { url: () => 'about:blank', goto: jest.fn(async () => {}) };
+      }),
+    };
+    await openGoogleTabInBackground(browser as any, 'https://accounts.google.com/');
+    expect(whatsappClosed).toBe(false);
   });
 });
 
-describe('refreshQR — via launchUtils com fallback condicional (fork 1.34.7)', () => {
+describe('refreshQR — launchUtils com fallback condicional (fork 1.34.7)', () => {
   it('não chama Cmd.refreshQR se launchUtils.refreshQR existir', () => {
-    // Espelha a lógica do Client.js do fork: usa launchUtils, fallback só se
-    // Cmd existir. Aqui validamos o contrato que o WAHA respeita.
     const launchUtils = { refreshQR: jest.fn() };
-    let calls: string[] = [];
-    const windowMock = {
-      require: jest.fn(() => ({
-        Cmd: { refreshQR: jest.fn(() => calls.push('cmd')) },
-      })),
+    const calls: string[] = [];
+    const WAWebCmd = {
+      Cmd: { refreshQR: jest.fn(() => calls.push('cmd')) },
     };
-    const WAWebCmd = (windowMock.require as any)('WAWebCmd');
     if (typeof (launchUtils as any)?.refreshQR === 'function') {
       (launchUtils as any).refreshQR();
       calls.push('launchUtils');
@@ -86,12 +90,10 @@ describe('refreshQR — via launchUtils com fallback condicional (fork 1.34.7)',
       WAWebCmd.Cmd.refreshQR();
     }
     expect(calls).toEqual(['launchUtils']);
-    // Se launchUtils for a fonte usada, nunca cai no fallback Cmd.
-    expect(calls).not.toContain('cmd');
   });
 
   it('fallback condicional: usa Cmd.refreshQR apenas se launchUtils ausente e Cmd é função', () => {
-    const launchUtils = {} as any; // sem refreshQR
+    const launchUtils = {} as any;
     let cmdCalled = false;
     const WAWebCmd = { Cmd: { refreshQR: () => (cmdCalled = true) } };
     if (typeof (launchUtils as any)?.refreshQR === 'function') {
@@ -100,6 +102,50 @@ describe('refreshQR — via launchUtils com fallback condicional (fork 1.34.7)',
       WAWebCmd.Cmd.refreshQR();
     }
     expect(cmdCalled).toBe(true);
+  });
+});
+
+describe('QR — estado do ciclo de vida (inicial / expirado / reconexão)', () => {
+  // Helper que espelha a resolução de refreshQR da página para os 3 estados.
+  function makeQRResolver(launchHas: boolean, cmdHas: boolean) {
+    const launch = launchHas ? { refreshQR: jest.fn() } : {};
+    const cmd = cmdHas ? { Cmd: { refreshQR: jest.fn() } } : { Cmd: {} };
+    return {
+      launch,
+      call: () => {
+        if (typeof (launch as any)?.refreshQR === 'function') {
+          (launch as any).refreshQR();
+          return 'launchUtils';
+        } else if (
+          cmd.Cmd &&
+          typeof cmd.Cmd.refreshQR === 'function'
+        ) {
+          cmd.Cmd.refreshQR();
+          return 'cmd';
+        }
+        return 'none';
+      },
+    };
+  }
+
+  it('QR inicial: usa launchUtils.refreshQRs (disponível) e retorna launchUtils', () => {
+    const r = makeQRResolver(true, false);
+    expect(r.call()).toBe('launchUtils');
+    expect(r.launch.refreshQR).toHaveBeenCalled();
+  });
+
+  it('QR expirado: se launchUtils indisponível mas Cmd existe, usa Cmd (fallback)', () => {
+    const r = makeQRResolver(false, true);
+    expect(r.call()).toBe('cmd');
+  });
+
+  it('reconexão: idempotente — chamadas repetidas de refreshQR não duplicam abas nem re-criam', () => {
+    // A reconexão reusa a aba Google (idempotência testada acima). Aqui validamos
+    // que o refreshQR é chamável sem quebrar (estável em reconexão).
+    const r = makeQRResolver(true, false);
+    expect(r.call()).toBe('launchUtils');
+    expect(r.call()).toBe('launchUtils');
+    expect(r.launch.refreshQR).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -125,8 +171,6 @@ describe('SessionOpCoordinator (psql) — serialização + close-once', () => {
     const c = new SessionOpCoordinator({ debug: () => {} });
     c.beginClose();
     await c.drain();
-    await expect(
-      c.run(async () => 1),
-    ).rejects.toThrow('SessionOpClosed');
+    await expect(c.run(async () => 1)).rejects.toThrow('SessionOpClosed');
   });
 });

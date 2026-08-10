@@ -4,6 +4,7 @@ import {
   resolveWebjsBrowserTabArgs,
   shouldOpenGoogleTab,
   googleTabUrlFromEnv,
+  openGoogleTabInBackground,
 } from './webjs-browser-tabs';
 
 import {
@@ -288,7 +289,6 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
       ...resolveWebjsBrowserTabArgs(
         sd,
         !!sd && shouldOpenGoogleTab(process.env),
-        googleTabUrlFromEnv(process.env),
       ),
     );
     const deviceName =
@@ -581,6 +581,10 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
       this.printQR(this.qr);
       this.status = WAHASessionStatus.SCAN_QR_CODE;
       this.lastQRDate = new Date();
+      // QR renderizado: pagina WhatsApp inicializada. Abre a UNICA aba Google
+      // no MESMO Chromium, em background e idempotente (reusa se existir;
+      // nunca duplica, nunca normaliza, nunca fecha a pagina WhatsApp).
+      this.openGoogleAuxTab().catch(() => {});
     });
 
     this.whatsapp.on(Events.READY, () => {
@@ -685,6 +689,21 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
         log.info('Session has recovered, no need to restart.');
       });
     });
+  }
+
+  /** Abre a UNICA aba Google em background (idempotente), no MESMO Chromium,
+   *  depois que a pagina WhatsApp esta inicializada e o QR renderizado.
+   *  Se a flag WAHA_WEBJS_OPEN_GOOGLE_TAB=false, nao abre. Nunca duplica,
+   *  nunca normaliza e nunca fecha a pagina WhatsApp. */
+  private async openGoogleAuxTab(): Promise<void> {
+    if (!shouldOpenGoogleTab(process.env)) {
+      return;
+    }
+    const browser = this.whatsapp?.pupBrowser;
+    if (!browser) {
+      return;
+    }
+    await openGoogleTabInBackground(browser, googleTabUrlFromEnv(process.env));
   }
 
   private async loadClientInfo() {
