@@ -1,5 +1,6 @@
 import { sleep } from '@nestjs/terminus/dist/utils';
 import { PsqlFileRepository } from '@waha/core/storage/psql/PsqlFileRepository';
+import { SessionOpCoordinator } from '@waha/core/storage/psql/SessionOpCoordinator';
 import Knex from 'knex';
 import { Logger } from 'pino';
 import { Store } from 'whatsapp-web.js';
@@ -16,13 +17,22 @@ class WebjsFileRepository extends PsqlFileRepository {
 }
 
 export class WebJSPsqlAuth implements Store {
-  private repository: PsqlFileRepository;
+  repository: PsqlFileRepository;
 
   constructor(
     private knex: Knex.Knex,
     private logger: Logger,
+    private coordinator?: SessionOpCoordinator,
   ) {
-    this.repository = new WebjsFileRepository(knex, logger);
+    this.repository = new WebjsFileRepository(knex, logger, coordinator);
+    this.coordinator = coordinator;
+  }
+
+  // Drena as operações pendentes do repositório (usado num logout real antes
+  // de destruir o pool, garantindo que o COPY não esteja pendente).
+  async drain(): Promise<void> {
+    if (this.coordinator) { await this.coordinator.drain(); return; }
+    await this.repository.drain();
   }
 
   async sessionExists(options: Options): Promise<boolean> {
@@ -70,6 +80,35 @@ export class WebJSPsqlAuth implements Store {
   }
 
   async close() {
-    await this.knex.destroy();
+    try {
+      await this.knex.destroy();
+    } catch (err) {
+      // "aborted" ocorre quando o pool tem operações pendentes (teardown
+      // durante reconnect/logout com backup-sync em voo). Destruir o pool não
+      // deve derrubar a sessão: engole e força a liberação dos handles.
+      this.logger.warn(
+        `WebJSPsqlAuth.close: knex destroy aborted (${(err as Error).message}) — forcing teardown`,
+      );
+      try {
+        await this.knex.destroy();
+      } catch (_second) {
+        /* ignore */
+      }
+      try {
+        const pool = (this.knex.client as any).pool;
+        if (pool && pool.numUsed) {
+          const used = pool.numUsed();
+          for (let i = 0; i < (used || 0) && pool.destroy; i++) {
+            try {
+              pool.destroy();
+            } catch (_p) {
+              /* ignore */
+            }
+          }
+        }
+      } catch (_poolErr) {
+        /* ignore */
+      }
+    }
   }
 }

@@ -1,4 +1,11 @@
 import { UnprocessableEntityException } from '@nestjs/common';
+import { ensureSerializedMessageId } from '@waha/core/utils/message-hydration';
+import {
+  resolveWebjsBrowserTabArgs,
+  shouldOpenGoogleTab,
+  googleTabUrlFromEnv,
+} from './webjs-browser-tabs';
+
 import {
   getChannelInviteLink,
   getPublicUrlFromDirectPath,
@@ -210,6 +217,7 @@ export interface WebJSConfig {
   puppeteerArgs: string[];
 }
 
+
 export class WhatsappSessionWebJSCore extends WhatsappSession {
   private START_ATTEMPT_DELAY_SECONDS = 2;
 
@@ -267,11 +275,28 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
     // add at the start
     args.unshift(`--a-waha-timestamp=${new Date()}`);
     args.unshift(`--a-waha-session=${this.name}`);
+    // Display / aba auxiliar Google (portado do build 17945a2b, funcional):
+    // o Chromium do WAHA eh o UNICO dono da pagina web.whatsapp.com (client
+    // page). A 2a aba (Google) e aberta no MESMO Chromium via URL inicial
+    // accounts.google.com, controlada por WAHA_WEBJS_OPEN_GOOGLE_TAB. O
+    // Chromium nao duplica WhatsApp; o wa-connect (display-only) nao sobe
+    // Chromium proprio.
+    const clientConfig = this.sessionConfig?.client ?? {};
+    // `display` e uma extensao do fluxo open-vnc (nao declarada no tipo base).
+    const sd = (clientConfig as any)?.display || null;
+    args.push(
+      ...resolveWebjsBrowserTabArgs(
+        sd,
+        !!sd && shouldOpenGoogleTab(process.env),
+        googleTabUrlFromEnv(process.env),
+      ),
+    );
     const deviceName =
       this.sessionConfig?.client?.deviceName ?? WAHA_CLIENT_DEVICE_NAME;
     const browserName =
       this.sessionConfig?.client?.browserName ?? WAHA_CLIENT_BROWSER_NAME;
     return {
+      authTimeoutMs: 180_000, // auth180 homologado
       puppeteer: {
         protocolTimeout: 300_000,
         headless: true,
@@ -2250,6 +2275,10 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
     message: Message,
     downloadMedia = true,
   ) {
+    // Hidratacao homologada: canonicaliza message.id._serialized antes de qualquer uso.
+    if (message) {
+      try { ensureSerializedMessageId(message); } catch (e) { /* non-fatal */ }
+    }
     // Convert
     const wamessage = this.toWAMessage(message);
     // Media
@@ -2395,9 +2424,26 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
   }
 
   protected toWAMessage(message: Message): WAMessage {
+    // Homologated guard: drop events without a valid message.id (prevents
+    // parseMessageIdSerialized(undefined) and duplicate/empty dedup issues).
+    const rawId = message && message.id;
+    if (!rawId || !rawId.id || !rawId._serialized) {
+      this.logger.warn(
+        { type: message && (message as any).type },
+        'toWAMessage skipped (no valid message.id)',
+      );
+      return null;
+    }
     const replyTo = this.extractReplyTo(message);
     const source = this.getMessageSource(message.id.id);
     const key = parseMessageIdSerialized(message.id._serialized);
+    if (!key) {
+      this.logger.warn(
+        { _serialized: message.id._serialized },
+        'parseMessageIdSerialized returned undefined; dropping event',
+      );
+      return null;
+    }
     // @ts-ignore
     return {
       id: message.id._serialized,

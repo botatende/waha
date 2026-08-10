@@ -12,6 +12,7 @@ import { Logger } from 'pino';
 import { AuthStrategy } from 'whatsapp-web.js';
 
 import { WebJSPsqlAuth } from './WebJSPsqlAuth';
+import { SessionOpCoordinator } from '@waha/core/storage/psql/SessionOpCoordinator';
 
 export class WebJSAuthFactory {
   async buildAuth(
@@ -49,7 +50,10 @@ export class WebJSAuthFactory {
   ) {
     const logger = loggerBuilder.child({ name: WebJSPsqlAuth.name });
     const knex = store.buildSessionKnex(name, 'Session/Auth');
-    const authStore = new WebJSPsqlAuth(knex, logger);
+    // Coordenador de operações POR SESSÃO, compartilhado entre o store e a auth,
+    // para serializar todas as ops do knex e evitar a saturação do pool.
+    const coordinator = new SessionOpCoordinator(logger);
+    const authStore = new WebJSPsqlAuth(knex, logger, coordinator);
     await authStore.init();
     const zipper = this.getAvailableZipper(logger);
     return new RemoteAuth({
@@ -58,6 +62,7 @@ export class WebJSAuthFactory {
       dataPath: null,
       logger: loggerBuilder.child({ name: RemoteAuth.name }),
       store: authStore,
+      coordinator: coordinator,
       zipper: zipper,
     });
   }

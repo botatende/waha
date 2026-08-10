@@ -3,6 +3,7 @@ import { stat } from 'fs/promises';
 import { pipeline } from 'stream/promises';
 import { Transform, TransformCallback } from 'stream';
 import Knex from 'knex';
+import { SessionOpCoordinator } from '@waha/core/storage/psql/SessionOpCoordinator';
 import { Logger } from 'pino';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -229,7 +230,89 @@ export class PsqlFileRepository {
   constructor(
     private knex: Knex.Knex,
     private logger: Logger,
-  ) {}
+    private coordinator?: SessionOpCoordinator,
+  ) {
+    // Coordenador por-sessão compartilhado (ou fila interna de fallback).
+    this._chain = Promise.resolve();
+  }
+
+  private _enqueue<T>(fn: () => Promise<T>, priority: 'high' | 'low' = 'high'): Promise<T> {
+    if (this.coordinator) return this.coordinator.run(fn, { priority });
+    return this._serialize(fn);
+  }
+
+  private _chain: Promise<any>;
+
+  // Aguarda todas as operações serializadas pendentes concluírem (drain),
+  // usado antes de destruir o pool num logout real.
+  async drain(): Promise<void> {
+    if (this.coordinator) { await this.coordinator.drain(); return; }
+    await this._chain.catch(() => {});
+  }
+
+  // Serialize via the shared per-session coordinator when present (fallback: local chain).
+  private _serialize<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.coordinator) return this.coordinator.run(fn);
+    const run = this._chain.then(fn, fn);
+    // Keep the chain alive even if fn rejects (do not break the mutex).
+    this._chain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  // Acquire a raw connection, tracking the outcome for telemetry.
+  private async _acquire(op: string): Promise<any> {
+    const conn = await (this.knex.client as any).acquireConnection();
+    this.logger.debug(`PG acquire ${op}`);
+    return conn;
+  }
+
+  // Release on success; DESTROY on error/abort so a broken connection is never
+  // returned idle to the pool (which would leak capacity and saturate it).
+  private _release(conn: any, op: string, ok: boolean): void {
+    if (!conn) return;
+    if (ok) {
+      try {
+        (this.knex.client as any).releaseConnection(conn);
+      } catch (e) {
+        this.logger.debug(`PG release-fail ${op}: ${(e as Error).message}`);
+      }
+      this.logger.debug(`PG release ${op}`);
+    } else {
+      try {
+        conn.release!(false);
+      } catch (e) {
+        /* ignore */
+      }
+      try {
+        (this.knex.client as any).releaseConnection(conn);
+      } catch (e) {
+        /* ignore */
+      }
+      try {
+        if (conn.end) conn.end().catch(() => {});
+      } catch (e) {
+        /* ignore */
+      }
+      this.logger.warn(`PG destroy (abort) ${op}`);
+    }
+  }
+
+  // Raw (non-serialized) query helpers used ONLY internally by already-serialized
+  // methods, to avoid deadlocking the mutex on nested calls.
+  private async _existsRaw(fullpath: string): Promise<boolean> {
+    const result = await this.table().where('fullpath', fullpath);
+    return result.length > 0;
+  }
+
+  private async _touchRaw(fullpath: string): Promise<void> {
+    const now = new Date().toISOString();
+    await this.table()
+      .where('fullpath', fullpath)
+      .update({ last_accessed_at: now });
+  }
 
   protected table() {
     return this.knex(this.tableName);
@@ -241,120 +324,130 @@ export class PsqlFileRepository {
    * into the real table — safe for arbitrarily large files.
    */
   async saveFromFile(fullpath: string, inputPath: string, metadata: any = {}) {
-    const { size } = await stat(inputPath);
-    const now = new Date().toISOString();
-
-    const conn = await (this.knex.client as any).acquireConnection();
-    try {
-      await conn.query('BEGIN');
+    return this._serialize(async () => {
+      const { size } = await stat(inputPath);
+      const now = new Date().toISOString();
+      let conn: any = null;
+      let ok = true;
+      let copyStream: any = null;
       try {
-        // Reuse the same temp table across pool connections; ON COMMIT DELETE ROWS
-        // clears it automatically at every successful COMMIT.
-        await conn.query(
-          'CREATE TEMP TABLE IF NOT EXISTS _waha_copy_tmp (content BYTEA) ON COMMIT DELETE ROWS',
-        );
-        // Guard against leftover rows from a previously rolled-back transaction.
-        await conn.query('TRUNCATE _waha_copy_tmp');
+        conn = await this._acquire('saveFromFile(' + fullpath + ')');
+        await conn.query('BEGIN');
+        try {
+          await conn.query(
+            'CREATE TEMP TABLE IF NOT EXISTS _waha_copy_tmp (content BYTEA) ON COMMIT DELETE ROWS',
+          );
+          await conn.query('TRUNCATE _waha_copy_tmp');
+          copyStream = conn.query(
+            copyFrom('COPY _waha_copy_tmp FROM STDIN (FORMAT BINARY)'),
+          );
+          await pipeline(
+            createReadStream(inputPath),
+            new PgBinaryWriteFrameStream(size),
+            copyStream,
+          );
 
-        const copyStream = conn.query(
-          copyFrom('COPY _waha_copy_tmp FROM STDIN (FORMAT BINARY)'),
-        );
-        await pipeline(
-          createReadStream(inputPath),
-          new PgBinaryWriteFrameStream(size),
-          copyStream,
-        );
-
-        await conn.query(
-          `INSERT INTO ${this.tableName} (fullpath, content, created_at, metadata)
+          await conn.query(
+            `INSERT INTO ${this.tableName} (fullpath, content, created_at, metadata)
            SELECT $1, content, $2, $3 FROM _waha_copy_tmp
            ON CONFLICT (fullpath) DO UPDATE SET
              content     = EXCLUDED.content,
              created_at  = EXCLUDED.created_at,
              metadata    = EXCLUDED.metadata`,
-          [fullpath, now, metadata],
-        );
+            [fullpath, now, metadata],
+          );
 
-        await conn.query('COMMIT');
-      } catch (err) {
-        await conn.query('ROLLBACK').catch(() => {});
-        throw err;
+          await conn.query('COMMIT');
+        } catch (err) {
+          ok = false;
+          await conn.query('ROLLBACK').catch(() => {});
+          try {
+            copyStream && copyStream.destroy && copyStream.destroy();
+          } catch (e) {
+            /* ignore */
+          }
+          throw err;
+        }
+      } finally {
+        // Release on success; DESTROY on error so a broken/COPY-interrupted
+        // connection is never returned to the pool.
+        this._release(conn, 'saveFromFile(' + fullpath + ')', ok);
       }
-    } finally {
-      (this.knex.client as any).releaseConnection(conn);
-    }
+    });
   }
 
   async save(fullpath: string, content: Buffer, metadata: any = {}) {
-    const now = new Date().toISOString();
-    await this.table()
-      .insert({
-        fullpath: fullpath,
-        content: content,
-        created_at: now,
-        metadata: metadata,
-      })
-      .onConflict('fullpath')
-      .merge({
-        content: this.knex.raw('EXCLUDED.content'),
-        created_at: this.knex.raw('EXCLUDED.created_at'),
-        metadata: this.knex.raw('EXCLUDED.metadata'),
-      });
+    return this._serialize(async () => {
+      const now = new Date().toISOString();
+      await this.table()
+        .insert({
+          fullpath: fullpath,
+          content: content,
+          created_at: now,
+          metadata: metadata,
+        })
+        .onConflict('fullpath')
+        .merge({
+          content: this.knex.raw('EXCLUDED.content'),
+          created_at: this.knex.raw('EXCLUDED.created_at'),
+          metadata: this.knex.raw('EXCLUDED.metadata'),
+        });
+    });
   }
 
   async exists(fullpath: string): Promise<boolean> {
-    const result = await this.table().where('fullpath', fullpath);
-    return result.length > 0;
+    return this._serialize(() => this._existsRaw(fullpath));
   }
 
   async delete(fullpath: string) {
-    await this.table().where('fullpath', fullpath).del();
+    return this._serialize(async () => {
+      await this.table().where('fullpath', fullpath).del();
+    });
   }
 
-  /**
-   * Stream the content of a stored file directly to disk without materialising
-   * it in memory.  Uses PostgreSQL binary COPY so the data never passes through
-   * Node's string layer — safe for arbitrarily large blobs.
-   *
-   * @returns true when the file was found and written; false when it does not exist.
-   */
   async fetchToFile(fullpath: string, outputPath: string): Promise<boolean> {
-    const exists = await this.exists(fullpath);
-    if (!exists) {
-      return false;
-    }
+    return this._serialize(async () => {
+      const exists = await this._existsRaw(fullpath);
+      if (!exists) {
+        return false;
+      }
+      const escaped = fullpath.replace(/'/g, "''");
+      const sql = `COPY (SELECT content FROM ${this.tableName} WHERE fullpath = '${escaped}') TO STDOUT (FORMAT BINARY)`;
 
-    // Single-quote escaping is sufficient: fullpath values are session-derived
-    // filenames that never contain single quotes, but we escape defensively.
-    const escaped = fullpath.replace(/'/g, "''");
-    const sql = `COPY (SELECT content FROM ${this.tableName} WHERE fullpath = '${escaped}') TO STDOUT (FORMAT BINARY)`;
+      let conn: any = null;
+      let ok = true;
+      try {
+        conn = await this._acquire('fetchToFile(' + fullpath + ')');
+        const copyStream = conn.query(copyTo(sql));
+        const writeStream = createWriteStream(outputPath);
+        await pipeline(copyStream, new PgBinaryFirstColumnStream(), writeStream);
+      } catch (err) {
+        ok = false;
+        throw err;
+      } finally {
+        this._release(conn, 'fetchToFile(' + fullpath + ')', ok);
+      }
 
-    const conn = await (this.knex.client as any).acquireConnection();
-    try {
-      const copyStream = conn.query(copyTo(sql));
-      const writeStream = createWriteStream(outputPath);
-      await pipeline(copyStream, new PgBinaryFirstColumnStream(), writeStream);
-    } finally {
-      (this.knex.client as any).releaseConnection(conn);
-    }
-
-    this.touch(fullpath).catch((err) => {
-      this.logger.error(`Failed to update last_accessed_at: ${err}`);
+      this._touchRaw(fullpath).catch((err) => {
+        this.logger.error(`Failed to update last_accessed_at: ${err}`);
+      });
+      return true;
     });
-    return true;
   }
 
   async fetch(fullpath: string): Promise<FileData | null> {
-    const result = await this.table().where('fullpath', fullpath);
-    const data = result.length > 0 ? result[0] : null;
-    if (!data) {
-      return null;
-    }
-    data.created_at = new Date(data.created_at).getTime();
-    this.touch(fullpath).catch((err) => {
-      this.logger.error(`Failed to save last accessed time: ${err}`);
+    return this._serialize(async () => {
+      const result = await this.table().where('fullpath', fullpath);
+      const data = result.length > 0 ? result[0] : null;
+      if (!data) {
+        return null;
+      }
+      data.created_at = new Date(data.created_at).getTime();
+      this._touchRaw(fullpath).catch((err) => {
+        this.logger.error(`Failed to save last accessed time: ${err}`);
+      });
+      return data;
     });
-    return data;
   }
 
   async init() {
@@ -362,10 +455,7 @@ export class PsqlFileRepository {
   }
 
   protected async touch(fullpath: string) {
-    const now = new Date().toISOString();
-    await this.table()
-      .where('fullpath', fullpath)
-      .update({ last_accessed_at: now });
+    return this._serialize(() => this._touchRaw(fullpath));
   }
 
   protected migrations() {

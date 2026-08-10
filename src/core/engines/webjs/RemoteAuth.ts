@@ -1,5 +1,6 @@
 import { sleep } from '@waha/utils/promiseTimeout';
 import { SinglePeriodicJobRunner } from '@waha/utils/SinglePeriodicJobRunner';
+import { SessionOpCoordinator } from '../../storage/psql/SessionOpCoordinator';
 import * as path from 'path';
 import pino, { Logger } from 'pino';
 import { AuthStrategy, Client, Events, Store } from 'whatsapp-web.js';
@@ -66,17 +67,10 @@ export class RemoteAuth implements AuthStrategy {
   private sessionName: string;
   private backupSyncRunner: SinglePeriodicJobRunner;
   private zipper: Zipper;
+  private coordinator: SessionOpCoordinator | null;
 
   constructor(
-    { clientId, dataPath, store, backupSyncIntervalMs, logger, zipper } = {
-      clientId: 'default',
-      dataPath: undefined,
-      store: null,
-      backupSyncIntervalMs: 60000,
-      zipper: undefined,
-      logger: undefined,
-    },
-  ) {
+    { clientId, dataPath, store, backupSyncIntervalMs, logger, zipper, coordinator }: any = {},) {
     if (!fs)
       throw new Error(
         'Optional Dependencies [fs-extra] are required to use RemoteAuth. Make sure to run npm install correctly and remove the --no-optional flag',
@@ -96,6 +90,7 @@ export class RemoteAuth implements AuthStrategy {
     if (!store) throw new Error('Remote database store is required.');
 
     this.store = store;
+    this.coordinator = coordinator || null;
     this.clientId = clientId;
     this.dataPath = path.resolve(dataPath || './.wwebjs_auth/');
     this.tempDir = `${this.dataPath}/wwebjs_temp_session_${this.clientId}`;
@@ -181,18 +176,64 @@ export class RemoteAuth implements AuthStrategy {
     }
   }
 
+  // Pool PostgreSQL vive por toda a vida útil da SESSÃO (regra: não recriar/destruir
+  // durante reconnect). `closeStoreOnDestroy` só é true num LOGOUT REAL.
+  private pooledClosed = false;
+  private closingPoolPromise: Promise<void> | null = null;
+
+  async syncData() {
+    // no-op placeholder to keep interface stable
+  }
+
+  async shutdownStore() {
+    await this.drainRepositoryOperations();
+    await this._closePoolOnce();
+  }
+
+  private async drainRepositoryOperations() {
+    const repo = (this.store as any)?.repository;
+    if (repo && typeof repo.drain === 'function') {
+      try {
+        await repo.drain();
+      } catch (e) {
+        this.logger.warn(`RemoteAuth.drain falhou: ${(e as Error).message}`);
+      }
+    }
+    // pequeno grace para resolver micro-tarefas pendentes
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  private async _closePoolOnce() {
+    if (this.pooledClosed || this.closingPoolPromise) return this.closingPoolPromise;
+    // @ts-ignore
+    if (!this.store?.close) return;
+    this.pooledClosed = true;
+    // @ts-ignore
+    this.closingPoolPromise = Promise.resolve().then(async () => {
+      try {
+        // @ts-ignore
+        await this.store.close();
+      } catch (err) {
+        this.logger.warn(`RemoteAuth._closePoolOnce: store.close falhou (${(err as Error).message}) — pool nao bloqueia sessao`);
+      }
+    }).catch(() => {}).finally(() => { this.closingPoolPromise = null; });
+    return this.closingPoolPromise;
+  }
+
   async logout() {
-    await this.disconnect();
-    await this.destroy();
+    if (this.coordinator) {
+      this.coordinator.beginClose(); // bloqueia novas ops + cancela backup
+      this.backupSyncRunner.stop();
+      await this.coordinator.drain(); // aguarda fila esvaziar (COPY etc)
+    }
+    await this.disconnect(); // deleteRemoteSession (auth excluida)
+    await this.shutdownStore(); // drena + fecha pool
   }
 
   async destroy() {
+    // Reconnect/stop->start: NAO fecha o pool PostgreSQL (regra 1/3).
+    // Apenas para o backup-sync; o pool vive pela sessão.
     this.backupSyncRunner.stop();
-    // @ts-ignore
-    if (this.store.close) {
-      // @ts-ignore
-      await this.store.close();
-    }
   }
 
   async disconnect() {
@@ -217,18 +258,25 @@ export class RemoteAuth implements AuthStrategy {
   }
 
   async storeRemoteSession() {
-    const pathExists = await isValidPath(this.userDataDir);
-    if (!pathExists) {
-      this.logger.warn(
-        'User data dir does not exist. Skipping session backup.',
-      );
-      return;
+    // Backup periódico: baixa prioridade + cancelable pelo coordenador da sessão.
+    const doBackup = async () => {
+      if (this.coordinator && this.coordinator.isClosing()) return;
+      const pathExists = await isValidPath(this.userDataDir);
+      if (!pathExists) {
+        this.logger.warn('User data dir does not exist. Skipping session backup.');
+        return;
+      }
+      await this.compressSession();
+      await this.store.save({ session: this.sessionName });
+      await this.removePathSilently(this.compressedSessionPath);
+      await this.removePathSilently(this.tempDir);
+    };
+    if (this.coordinator) {
+      return this.coordinator.run(doBackup, { priority: 'low' }).catch((e) => {
+        if ((e && e.message) !== 'SessionOpClosed') this.logger.error(e, 'backup sync error');
+      });
     }
-
-    await this.compressSession();
-    await this.store.save({ session: this.sessionName });
-    await this.removePathSilently(this.compressedSessionPath);
-    await this.removePathSilently(this.tempDir);
+    return doBackup();
   }
 
   async extractRemoteSession() {

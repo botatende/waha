@@ -11,6 +11,10 @@ export function parseMessageIdSerialized(
   messageId: string,
   soft: boolean = false,
 ): WAMessageKey {
+  if (typeof messageId !== 'string' || !messageId) {
+    // Homologated guard: no ID -> return undefined-like instead of throwing.
+    return { id: (messageId || '') as string } as WAMessageKey;
+  }
   if (!messageId.includes('_') && soft) {
     return { id: messageId };
   }
