@@ -9,6 +9,7 @@ import { monitorAuth, extractAndInject } from "./extractor.js";
 
 const log = (msg) => console.log(`[api] ${msg}`);
 const sessions = new Map();
+const openVncInFlight = {}; // single-flight p/ open-vnc by sessionName
 
 function json(res, status, data) {
   res.writeHead(status, {
@@ -162,122 +163,139 @@ const server = http.createServer(async (req, res) => {
 
     // =============================================
     //  POST /connect/open-vnc
-    //  Recebe nome da sessao, aloca/vincula display ao slot, faz merge idempotente
-    //  de client.display na config da sessao WAHA (PRESERVANDO webhook/engine/
-    //  PostgreSQL) e start/reconnect — NUNCA logout/delete. Retorna VNC URL.
-    //  Abra repetido reutiliza o mesmo slot e reaplica o vinculo se ausente.
+    //  Recebe o nome da sessao. Lógica por estado (NUNCA delete/logout para
+    //  sessao existente; single-flight p/ chamadas concorrentes):
+    //   - inexistente                -> create uma vez (start)
+    //   - WORKING                    -> retorna "já conectada" (sem abrir VNC/restart)
+    //   - SCAN_QR/STARTING/PAIRING    -> reutiliza VNC do slot ativo, sem stop/start
+    //   - STOPPED/FAILED              -> aplica display e faz SOMENTE um start
     // =============================================
     if (req.method === "POST" && pathname === "/connect/open-vnc") {
       const body = await parseBody(req);
       const sessionName = body.sessionName || "wa_vnc_" + Date.now();
       const token = body.token || sessionName;
 
-      log("Opening VNC for session " + sessionName + " (token: " + token + ")");
-
-      try {
-        // 1. Alocar display (reutiliza slot vivo da mesma sessao se houver).
-        const displayInfo = await allocateDisplay(token, sessionName);
-        const displayNum = displayInfo.display; // ex.: 20 (slot)
-
-        // 2. Gravar vinculo sessionName -> display (lifecycle do wa-connect).
-        sessions.set(token, {
-          status: "display_allocated",
-          sessionName,
-          display: displayNum,
-          createdAt: Date.now(),
-        });
-
-        // 3. Merge idempotente: garantir client.display.":" + displayNum na config
-        //    da sessao, preservando TODO o restante (webhook, engine, PostgreSQL).
-        const wahaBase = new URL(config.waha.apiUrl);
-        const sessionPath = "/api/sessions/" + encodeURIComponent(sessionName);
-
-        // 3a. Checar se a sessao ja existe (GET).
-        const existing = await new Promise((resolve) => {
-          const req2 = http.request({
-            hostname: wahaBase.hostname, port: wahaBase.port,
-            path: sessionPath, method: "GET",
-            headers: { "X-Api-Key": config.waha.apiKey }, timeout: 8000,
-          }, (res2) => {
-            let d = ""; res2.on("data", (c) => d += c);
-            res2.on("end", () => {
-              try { resolve({ exists: res2.statusCode === 200, body: JSON.parse(d) }); }
-              catch { resolve({ exists: res2.statusCode === 200, body: d }); }
-            });
-          });
-          req2.on("error", () => resolve({ exists: false }));
-          req2.end();
-        });
-
-        if (existing && existing.exists) {
-          // Reconnect: stop -> merge display -> start (NUNCA logout/delete).
-          log("open-vnc: sessao existe " + sessionName + " — reconnect com display :" + displayNum);
-          await new Promise((resolve) => {
-            const r = http.request({
-              hostname: wahaBase.hostname, port: wahaBase.port,
-              path: sessionPath + "/stop", method: "POST",
-              headers: { "X-Api-Key": config.waha.apiKey }, timeout: 8000,
-            }, () => { resolve(); }); r.on("error", () => resolve()); r.end();
-          });
-          // Preserva a config existente e garante client.display (merge idempotente).
-          const curConfig = (existing.body && existing.body.config) || {};
-          const mergedConfig = Object.assign({}, curConfig, {
-            client: Object.assign({}, (curConfig.client || {}), { display: ":" + displayNum }),
-          });
-          await new Promise((resolve, reject) => {
-            const putReq = http.request({
-              hostname: wahaBase.hostname, port: wahaBase.port,
-              path: sessionPath, method: "PUT",
-              headers: { "Content-Type": "application/json", "X-Api-Key": config.waha.apiKey },
-            }, (res2) => { let d=""; res2.on("data",(c)=>d+=c); res2.on("end",()=>resolve(d)); });
-            putReq.on("error", reject);
-            putReq.write(JSON.stringify({ name: sessionName, config: mergedConfig }));
-            putReq.end();
-          });
-          await new Promise((resolve) => {
-            const r = http.request({
-              hostname: wahaBase.hostname, port: wahaBase.port,
-              path: sessionPath + "/start", method: "POST",
-              headers: { "X-Api-Key": config.waha.apiKey }, timeout: 8000,
-            }, () => { resolve(); }); r.on("error", () => resolve()); r.end();
-          });
-          log("WAHA session reconnected: " + sessionName + " (display :" + displayNum + ")");
-        } else {
-          // 3b. Criar sessao nova com client.display.
-          const sessionBody = JSON.stringify({
-            name: sessionName,
-            config: {
-              engine: "WEBJS",
-              webjs: { tagsEventsOn: false },
-              client: { display: ":" + displayNum },
-            },
-            start: true,
-          });
-          await new Promise((resolve, reject) => {
-            const postReq = http.request({
-              hostname: wahaBase.hostname, port: wahaBase.port,
-              path: "/api/sessions", method: "POST",
-              headers: { "Content-Type": "application/json", "X-Api-Key": config.waha.apiKey },
-            }, (postRes) => { let d=""; postRes.on("data",(c)=>d+=c); postRes.on("end",()=>resolve(d)); });
-            postReq.on("error", reject);
-            postReq.write(sessionBody);
-            postReq.end();
-          });
-          log("WAHA session created: " + sessionName + " (display :" + displayNum + ")");
-        }
-
-        json(res, 200, {
-          token,
-          sessionName,
-          status: "display_allocated",
-          vncUrl: displayInfo.vncUrl,
-          display: displayNum,
-        });
-      } catch (e) {
-        log("open-vnc error: " + e.message);
-        json(res, 500, { error: e.message });
+      // Single-flight por sessionName: chamadas concorrentes compartilham a
+      // mesma promise (nunca múltiplos reconnects/starts).
+      if (openVncInFlight[sessionName]) {
+        log(`open-vnc: reutilizando operação em andamento de ${sessionName}`);
+        return openVncInFlight[sessionName];
       }
-      return;
+      openVncInFlight[sessionName] = (async () => {
+        log("Opening VNC for session " + sessionName + " (token: " + token + ")");
+        try {
+          // Alocar/reutilizar display (slot).
+          const displayInfo = await allocateDisplay(token, sessionName);
+          const displayNum = displayInfo.display; // ex.: 20 (slot)
+          const wahaBase = new URL(config.waha.apiUrl);
+          const sessionPath = "/api/sessions/" + encodeURIComponent(sessionName);
+
+          // Lê o estado atual da sessão WAHA.
+          const existing = await new Promise((resolve) => {
+            const req2 = http.request({
+              hostname: wahaBase.hostname, port: wahaBase.port,
+              path: sessionPath, method: "GET",
+              headers: { "X-Api-Key": config.waha.apiKey }, timeout: 8000,
+            }, (res2) => {
+              let d = ""; res2.on("data", (c) => d += c);
+              res2.on("end", () => {
+                try { resolve({ exists: res2.statusCode === 200, body: JSON.parse(d) }); }
+                catch { resolve({ exists: res2.statusCode === 200, body: d }); }
+              });
+            });
+            req2.on("error", () => resolve({ exists: false }));
+            req2.end();
+          });
+
+          const status = existing.exists ? (existing.body && existing.body.status) : null;
+
+          if (!existing.exists) {
+            // Inexistente -> create uma vez (start).
+            const sessionBody = JSON.stringify({
+              name: sessionName,
+              config: {
+                engine: "WEBJS",
+                webjs: { tagsEventsOn: false },
+                client: { display: ":" + displayNum },
+              },
+              start: true,
+            });
+            await new Promise((resolve, reject) => {
+              const postReq = http.request({
+                hostname: wahaBase.hostname, port: wahaBase.port,
+                path: "/api/sessions", method: "POST",
+                headers: { "Content-Type": "application/json", "X-Api-Key": config.waha.apiKey },
+              }, (postRes) => { let d=""; postRes.on("data",(c)=>d+=c); postRes.on("end",()=>resolve(d)); });
+              postReq.on("error", reject);
+              postReq.write(sessionBody);
+              postReq.end();
+            });
+            log("open-vnc: sessao criada " + sessionName + " (display :" + displayNum + ")");
+          } else if (status === "WORKING") {
+            // Já conectada -> sem abrir VNC/restart.
+            log("open-vnc: " + sessionName + " já WORKING — sem restart");
+          } else if (status === "SCAN_QR_CODE" || status === "STARTING" || status === "PAIRING") {
+            // Reutiliza VNC do slot ativo; garante display no config se ausente.
+            log("open-vnc: " + sessionName + " em " + status + " — reutiliza VNC, sem stop/start");
+            const curConfig = (existing.body && existing.body.config) || {};
+            if (!(curConfig.client && curConfig.client.display)) {
+              const merged = Object.assign({}, curConfig, {
+                client: Object.assign({}, (curConfig.client || {}), { display: ":" + displayNum }),
+              });
+              await new Promise((resolve, reject) => {
+                const putReq = http.request({
+                  hostname: wahaBase.hostname, port: wahaBase.port,
+                  path: sessionPath, method: "PUT",
+                  headers: { "Content-Type": "application/json", "X-Api-Key": config.waha.apiKey },
+                }, (res2) => { let d=""; res2.on("data",(c)=>d+=c); res2.on("end",()=>resolve(d)); });
+                putReq.on("error", reject);
+                putReq.write(JSON.stringify({ name: sessionName, config: merged }));
+                putReq.end();
+              });
+            }
+          } else {
+            // STOPPED/FAILED -> aplica display e faz SOMENTE um start.
+            log("open-vnc: " + sessionName + " em " + status + " — start unico");
+            const curConfig = (existing.body && existing.body.config) || {};
+            const merged = Object.assign({}, curConfig, {
+              client: Object.assign({}, (curConfig.client || {}), { display: ":" + displayNum }),
+            });
+            await new Promise((resolve, reject) => {
+              const putReq = http.request({
+                hostname: wahaBase.hostname, port: wahaBase.port,
+                path: sessionPath, method: "PUT",
+                headers: { "Content-Type": "application/json", "X-Api-Key": config.waha.apiKey },
+              }, (res2) => { let d=""; res2.on("data",(c)=>d+=c); res2.on("end",()=>resolve(d)); });
+              putReq.on("error", reject);
+              putReq.write(JSON.stringify({ name: sessionName, config: merged }));
+              putReq.end();
+            });
+            await new Promise((resolve) => {
+              const r = http.request({
+                hostname: wahaBase.hostname, port: wahaBase.port,
+                path: sessionPath + "/start", method: "POST",
+                headers: { "X-Api-Key": config.waha.apiKey }, timeout: 8000,
+              }, () => { resolve(); }); r.on("error", () => resolve()); r.end();
+            });
+            log("open-vnc: " + sessionName + " startado (display :" + displayNum + ")");
+          }
+
+          json(res, 200, {
+            token,
+            sessionName,
+            status: "display_allocated",
+            vncUrl: displayInfo.vncUrl,
+            display: displayNum,
+          });
+        } catch (e) {
+          log("open-vnc error: " + e.message);
+          json(res, 500, { error: e.message });
+        } finally {
+          delete openVncInFlight[sessionName];
+        }
+        return;
+      })();
+      return openVncInFlight[sessionName];
     }
 
     // =============================================

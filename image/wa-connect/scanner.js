@@ -962,21 +962,11 @@ export function startCleanupInterval() {
         continue;
       }
 
-      // Idle timeout: no VNC client connection
-      if (!entry.authenticated || entry.status === 'waiting_qr' || entry.status === 'display_allocated') {
-        const hasClient = hasVncClientConnection(entry.slot);
-        if (!hasClient && now - entry.lastActivity > noClientTimeout) {
-          log(`Idle timeout (no VNC client) for ${entry.sessionName}, cleaning up`);
-          // Libera apenas o slot temporario do VNC; nao remove sessao WAHA.
-          cleanup(token);
-          continue;
-        }
-
-        // Update lastActivity if has client (to give more time while user is watching)
-        if (hasClient) {
-          entry.lastActivity = now;
-        }
-      }
+      // Cleanup por idle NO-CLIENT e DESATIVADO durante pareamento (waiting_qr /
+      // display_allocated nao autenticada): hasVncClientConnection=false NAO pode
+      // limpar o slot enquanto o scan esta em andamento (evita abort do VNC/QR).
+      // Cleanup ocorre apenas por: cancelamento explicito, sessao removida,
+      // WORKING apos grace, ou hard-timeout (maxTotalSlotTime).
 
       // Stale unauthenticated sessions (fallback, already handled by maxAuthWait in index.js)
       if (!entry.authenticated && now - entry.createdAt > config.scan.maxAuthWait) {
