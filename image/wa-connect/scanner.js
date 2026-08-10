@@ -571,7 +571,16 @@ export async function allocateDisplay(token, sessionName, options = {}) {
   if (existingSlot && existingSlot.entry && existingSlot.entry.status !== 'cleaned') {
     const e = existingSlot.entry;
     e.lastActivity = Date.now();
-    const slot = e.slot || { slotId: e.slotId, display: e.display ?? config.pool.displayStart + e.slotId, rfbPort: 0, webPort: 0 };
+    // IMPORTANTE: webPort/rfbPort SEMPRE derivados do slotId (nunca 0), para o
+    // hasVncClientConnection detectar o cliente e evitar idle-cleanup indevido.
+    const slot = e.slot && (e.slot.webPort || e.slot.rfbPort)
+      ? e.slot
+      : {
+          slotId: e.slotId,
+          display: e.display ?? config.pool.displayStart + e.slotId,
+          rfbPort: (e.slot && e.slot.rfbPort) || config.pool.vncRfbStart + e.slotId,
+          webPort: (e.slot && e.slot.webPort) || config.pool.vncWebStart + e.slotId,
+        };
     log(`allocateDisplay: reutilizando slot vivo de ${sessionName} (slot ${e.slotId}, display :${slot.display})`);
     startWahaMonitor(existingSlot.token, sessionName);
     return {
