@@ -564,6 +564,26 @@ export async function allocateDisplay(token, sessionName, options = {}) {
   // o single-flight evita starts duplicados, não o restart rate.
   // Apenas verifica wa-connect slots, WAHA pode ter 100+ sessões e o display
   // é um slot temporário do VNC, não um lock fixo na sessão WAHA.
+  // REUSE: se a sessao ja tem um slot vivo, reutiliza (mesmo display/portas)
+  // em vez de alocar novo — evita "Pool full" em open-vnc repetido e garante
+  // o vinculo sessionName -> display estavel (nothing to recreate).
+  const existingSlot = findSlotBySessionName(sessionName);
+  if (existingSlot && existingSlot.entry && existingSlot.entry.status !== 'cleaned') {
+    const e = existingSlot.entry;
+    e.lastActivity = Date.now();
+    const slot = e.slot || { slotId: e.slotId, display: e.display ?? config.pool.displayStart + e.slotId, rfbPort: 0, webPort: 0 };
+    log(`allocateDisplay: reutilizando slot vivo de ${sessionName} (slot ${e.slotId}, display :${slot.display})`);
+    startWahaMonitor(existingSlot.token, sessionName);
+    return {
+      token: existingSlot.token,
+      sessionName,
+      vncUrl: e.vncUrl || `http://${config.pool.vncExternalHost}:${config.pool.vncExternalPortStart + e.slotId}/vnc_lite.html?autoconnect=true&resize=scale&show_dot=false&showControlBar=false`,
+      display: slot.display,
+      webPort: config.pool.vncWebStart + e.slotId,
+      workingStableMs: e.workingStableMs || WORKING_STABLE_MS,
+    };
+  }
+
   const maxSlots = DYNAMIC_MAX_SLOTS;
   const used = new Set();
   for (const s of slots.values()) {
