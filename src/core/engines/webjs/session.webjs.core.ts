@@ -2146,9 +2146,54 @@ export class WhatsappSessionWebJSCore extends WhatsappSession {
         return { message, ack };
       },
     );
+    // Definicao antecipada do helper de destino (usado no mapper abaixo).
+    const resolveAckRemote = (message: any): string | null => {
+      try {
+        const remote =
+          (message?.id && (message.id.remote || message.id.address || null)) ||
+          (message?._data?.id?.remote) ||
+          (message?._data?.Info?.Chat) ||
+          (message?._data?.Info?.chat?.id) ||
+          null;
+        return typeof remote === 'string' && remote ? remote : null;
+      } catch (e) {
+        this.logger.debug({ err: String(e) }, 'ack.remote resolve error');
+        return null;
+      }
+    };
     const messagesAckDM$ = messageAckWEBJS$.pipe(
       map((event) => event.message),
-      map<any, WAMessage>(this.toWAMessage.bind(this)),
+      map<any, WAMessage | null>((message) => {
+        // Nunca lancar: qualquer erro de UM ack nao pode derrubar o pipe/sessao.
+        try {
+          // 1) Garantir id serializado ANTES do processamento.
+          if (!message) return null;
+          const withId = ensureSerializedMessageId(message);
+          if (!withId || !withId.id || !withId.id._serialized && !withId.id.id) return null;
+          const rem = resolveAckRemote(withId);
+          if (!rem) {
+            this.logger.debug(
+              { event: 'message.ack', reason: 'no valid remote' },
+              'message.ack skipped (no valid destination)',
+            );
+            return null;
+          }
+          // 2) Hidratacao LEVE: so id, ack, fromMe e remote. Nunca message.to.
+          return {
+            id: withId.id._serialized || withId.id.id,
+            fromMe: Boolean(withId.fromMe),
+            from: withId.fromMe ? (withId.from || rem) : (withId.from || rem),
+            to: rem,
+            ack: withId.ack,
+            ackName: WAMessageAck[withId.ack] || ACK_UNKNOWN,
+          } as any;
+        } catch (e) {
+          this.logger.debug({ err: String(e), event: 'message.ack' }, 'ack drop (non-fatal)');
+          return null;
+        }
+      }),
+      // Drop null (ACK invalido) ANTES de usar campos — evita "reading 	o\ of null".
+      filter((ack): ack is WAMessage => Boolean(ack && ack.id && ack.to)),
       filter((ack) => !isJidGroup(ack.to) && !isJidStatusBroadcast(ack.to)),
       filter((ack) => this.jids.include(ack.to)),
     );
