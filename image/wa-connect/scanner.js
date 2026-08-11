@@ -495,9 +495,14 @@ function startWahaMonitor(token, sessionName) {
         }
 
         if (now - current._workingSince >= workingStableMs) {
-          log(`WAHA session ${sessionName} stayed WORKING, auto-cleanup`);
-          clearInterval(interval);
-          cleanup(token);
+          // WORKING estavel: NAO liberar o display (preserva Xvfb/Chromium/slot;
+          // a sessao WEBJS precisa deles p/ continuar WORKING). Apenas fecha o
+          // transporte VNC publico (noVNC/x11vnc) apos backup PostgreSQL
+          // confirmado. O reabrir reinicia x11vnc/noVNC no mesmo display.
+          log(`WAHA session ${sessionName} stayed WORKING, fechando transporte VNC (display preservado)`);
+          if (!current._vncClosed) {
+            closeVncTransport(token);
+          }
         }
         return;
       }
@@ -582,6 +587,26 @@ export async function allocateDisplay(token, sessionName, options = {}) {
           webPort: (e.slot && e.slot.webPort) || config.pool.vncWebStart + e.slotId,
         };
     log(`allocateDisplay: reutilizando slot vivo de ${sessionName} (slot ${e.slotId}, display :${slot.display})`);
+
+    // Se o VNC foi fechado apos WORKING (closeVncTransport), reinicia apenas
+    // x11vnc/noVNC no MESMO Xvfb/display (preservado). Nunca recria Xvfb/Chromium.
+    if (e._vncClosed || !e.processes.x11vnc || !e.processes.novnc) {
+      try {
+        e.processes.x11vnc = await safeSpawn('x11vnc', [
+          '-display', `:${slot.display}`, '-forever', '-shared',
+          '-rfbport', String(slot.rfbPort), '-nopw', '-listen', '0.0.0.0',
+        ]);
+        await sleep(400);
+        e.processes.novnc = await safeSpawn('/usr/share/novnc/utils/novnc_proxy', [
+          '--listen', String(slot.webPort), '--vnc', `localhost:${slot.rfbPort}`,
+        ]);
+        await sleep(600);
+        e._vncClosed = false;
+        log(`allocateDisplay: VNC restaurado p/ ${sessionName} (display :${slot.display})`);
+      } catch (e2) {
+        log(`allocateDisplay: falha ao restaurar VNC de ${sessionName}: ${e2.message}`);
+      }
+    }
     startWahaMonitor(existingSlot.token, sessionName);
     return {
       token: existingSlot.token,
@@ -865,40 +890,51 @@ export async function startBrowser(token, sessionName, proxyUrl, options = {}) {
 // Cleanup
 // ============================================
 
-export function cleanup(token) {
+/**
+ * closeVncTransport: encerra SOMENTE o transporte VNC (noVNC/websockify + x11vnc),
+ * fechando acesso publico, mas PRESERVA Xvfb, Chromium, slot e vinculo da sessao.
+ * Chamado apos WORKING estavel + backup PostgreSQL confirmado. A sessao WEBJS
+ * continua WORKING (precisa do Xvfb/Chromium). Nunca mata Chromium/Xvfb.
+ */
+export function closeVncTransport(token) {
+  const entry = slots.get(token);
+  if (!entry || entry.status === 'cleaned') return;
+  log(`closeVncTransport: ${entry.sessionName} (fechando noVNC/x11vnc, preservando display)`);
+  try { if (entry.processes.novnc) { entry.processes.novnc.kill('SIGKILL'); entry.processes.novnc = null; } } catch (e) {}
+  try { if (entry.processes.x11vnc) { entry.processes.x11vnc.kill('SIGKILL'); entry.processes.x11vnc = null; } } catch (e) {}
+  entry._vncClosed = true;
+  entry.status = 'working_vnc_closed'; // progressivo; nao limpa
+}
+
+/**
+ * releaseDisplay: liberacao COMPLETA do slot/display (Xvfb/Chromium/tudo).
+ * Usado APENAS em exclusao real da sessao, cancelamento explicito ou
+ * hard-timeout de pareamento. NAO para WORKING_STABLE_MS.
+ */
+export function releaseDisplay(token) {
   const entry = slots.get(token);
   if (!entry || entry.status === 'cleaned') return;
   entry.status = 'cleaned';
-  log(`Cleaning up: ${entry.sessionName}`);
-
-  if (entry._monitorInterval) {
-    clearInterval(entry._monitorInterval);
-    entry._monitorInterval = null;
-  }
-
+  log(`releaseDisplay (cleanup completo): ${entry.sessionName}`);
+  if (entry._monitorInterval) { clearInterval(entry._monitorInterval); entry._monitorInterval = null; }
   try { if (entry.processes.chromium) entry.processes.chromium.kill('SIGKILL'); } catch (e) {}
   try { if (entry.processes.x11vnc) entry.processes.x11vnc.kill('SIGKILL'); } catch (e) {}
   try { if (entry.processes.novnc) entry.processes.novnc.kill('SIGKILL'); } catch (e) {}
   try { if (entry.processes.xvfb) entry.processes.xvfb.kill('SIGKILL'); } catch (e) {}
-
-  // Clean up lock files
   try {
     if (entry.userDataDir) {
       const files = fs.readdirSync(entry.userDataDir);
-      files.forEach(f => {
-        if (f.startsWith('Singleton'))
-          try { fs.unlinkSync(path.join(entry.userDataDir, f)); } catch (e) {}
-      });
+      files.forEach(f => { if (f.startsWith('Singleton')) try { fs.unlinkSync(path.join(entry.userDataDir, f)); } catch (e) {} });
     }
   } catch (e) {}
-
-  // Notifica a fila assim que o slot sai de uso; a remocao do Map fica atrasada
-  // apenas para status/debug e para dar tempo aos processos encerrarem.
   if (_onSlotFreed) setImmediate(_onSlotFreed);
-  setTimeout(() => {
-    slots.delete(token);
-  }, 5000);
-  log(`Cleaned up: ${entry.sessionName}`);
+  setTimeout(() => { slots.delete(token); }, 5000);
+  log(`Released display: ${entry.sessionName}`);
+}
+
+export function cleanup(token) {
+  // cleanup (completo) = release display real -> delegar a releaseDisplay.
+  releaseDisplay(token);
 }
 
 // ============================================
