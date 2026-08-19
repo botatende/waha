@@ -28,6 +28,7 @@ async function openGoogleTabInBackground(browser, url) {
         return;
     try {
         const pages = await browser.pages();
+        const primaryWhatsAppPage = await keepSingleWhatsAppPage(pages);
         const googlePage = pages.find((p) => {
             try {
                 const u = p.url() || '';
@@ -38,24 +39,44 @@ async function openGoogleTabInBackground(browser, url) {
             }
         });
         if (googlePage) {
-            await bringWhatsAppToFront(browser, pages);
+            await bringWhatsAppToFront(browser, await browser.pages(), primaryWhatsAppPage);
             return;
         }
         const page = await browser.newPage();
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { });
         // Garante WhatsApp em primeiro plano APOS abrir a aba Google em background.
-        await bringWhatsAppToFront(browser, await browser.pages());
+        const updatedPages = await browser.pages();
+        const keptWhatsAppPage = await keepSingleWhatsAppPage(updatedPages, primaryWhatsAppPage);
+        await bringWhatsAppToFront(browser, await browser.pages(), keptWhatsAppPage);
     }
     catch (e) {
     }
 }
+// Preserva a pagina WhatsApp principal e fecha somente duplicatas excedentes.
+async function keepSingleWhatsAppPage(pages, preferred) {
+    const whatsappPages = pages.filter((p) => {
+        try {
+            return String((p.url && p.url()) || '').includes('web.whatsapp.com');
+        }
+        catch (_a) {
+            return false;
+        }
+    });
+    const keep = preferred && whatsappPages.includes(preferred) ? preferred : whatsappPages[0];
+    for (const page of whatsappPages) {
+        if (page === keep || typeof page.close !== 'function')
+            continue;
+        await page.close().catch(() => { });
+    }
+    return keep;
+}
 // Re-foca a pagina WhatsApp (web.whatsapp.com) apos a Google abrir em background.
 // Usa Page.bringToFront() padrao (nao experimental, nao destrutivo); nunca cria,
 // feha ou normaliza abas; WhatsApp permanece a aba ativa de primeiro plano.
-async function bringWhatsAppToFront(browser, pages) {
+async function bringWhatsAppToFront(browser, pages, preferred) {
     try {
         const list = pages || (await browser.pages());
-        const wa = list.find((p) => {
+        const wa = preferred || list.find((p) => {
             try {
                 const u = p.url() || '';
                 return u.includes('web.whatsapp.com');
