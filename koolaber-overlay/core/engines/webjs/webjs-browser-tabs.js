@@ -28,7 +28,14 @@ async function openGoogleTabInBackground(browser, url) {
         return;
     try {
         const pages = await browser.pages();
-        const primaryWhatsAppPage = await keepSingleWhatsAppPage(pages);
+        const primaryWhatsAppPage = pages.find((p) => {
+            try {
+                return String((p.url && p.url()) || '').includes('web.whatsapp.com');
+            }
+            catch (_a) {
+                return false;
+            }
+        });
         const googlePage = pages.find((p) => {
             try {
                 const u = p.url() || '';
@@ -46,29 +53,10 @@ async function openGoogleTabInBackground(browser, url) {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => { });
         // Garante WhatsApp em primeiro plano APOS abrir a aba Google em background.
         const updatedPages = await browser.pages();
-        const keptWhatsAppPage = await keepSingleWhatsAppPage(updatedPages, primaryWhatsAppPage);
-        await bringWhatsAppToFront(browser, await browser.pages(), keptWhatsAppPage);
+        await bringWhatsAppToFront(browser, updatedPages, primaryWhatsAppPage);
     }
     catch (e) {
     }
-}
-// Preserva a pagina WhatsApp principal e fecha somente duplicatas excedentes.
-async function keepSingleWhatsAppPage(pages, preferred) {
-    const whatsappPages = pages.filter((p) => {
-        try {
-            return String((p.url && p.url()) || '').includes('web.whatsapp.com');
-        }
-        catch (_a) {
-            return false;
-        }
-    });
-    const keep = preferred && whatsappPages.includes(preferred) ? preferred : whatsappPages[0];
-    for (const page of whatsappPages) {
-        if (page === keep || typeof page.close !== 'function')
-            continue;
-        await page.close().catch(() => { });
-    }
-    return keep;
 }
 // Re-foca a pagina WhatsApp (web.whatsapp.com) apos a Google abrir em background.
 // Usa Page.bringToFront() padrao (nao experimental, nao destrutivo); nunca cria,

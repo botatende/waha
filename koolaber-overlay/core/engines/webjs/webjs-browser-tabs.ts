@@ -69,8 +69,8 @@ async function bringWhatsAppToFront(
  * Abre (ou reutiliza) UMA aba Google em background no MESMO Chromium e garante
  * que o WhatsApp volta a ser a aba ativa de primeiro plano.
  * Idempotente: se já existe uma página cujo domínio é o alvo, reutiliza; NUNCA
- * cria segunda página Google. Preserva a primeira página WhatsApp existente e
- * fecha somente páginas WhatsApp excedentes, evitando o segundo QR no startup.
+ * cria segunda página Google. As páginas WhatsApp nunca são fechadas ou
+ * normalizadas aqui: o ciclo de vida delas pertence ao cliente WEBJS.
  * Não usa Target.createTarget nem APIs experimentais.
  *
  * @param browser Puppeteer Browser (this.whatsapp.pupBrowser).
@@ -80,7 +80,13 @@ export async function openGoogleTabInBackground(browser: any, url: string): Prom
   if (!browser) return;
   try {
     const pages = await browser.pages();
-    const primaryWhatsAppPage = await keepSingleWhatsAppPage(pages);
+    const primaryWhatsAppPage = pages.find((p: any) => {
+      try {
+        return String(p.url?.() || '').includes('web.whatsapp.com');
+      } catch {
+        return false;
+      }
+    });
     const googlePage = pages.find((p: any) => {
       try {
         const u = p.url() || '';
@@ -96,26 +102,8 @@ export async function openGoogleTabInBackground(browser: any, url: string): Prom
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
     const updatedPages = await browser.pages();
-    const keptWhatsAppPage = await keepSingleWhatsAppPage(updatedPages, primaryWhatsAppPage);
-    await bringWhatsAppToFront(browser, await browser.pages(), keptWhatsAppPage);
+    await bringWhatsAppToFront(browser, updatedPages, primaryWhatsAppPage);
   } catch (e) {
     // Non-fatal: a aba Google é auxiliar; se falhar, não bloqueia o QR/scan.
   }
-}
-
-/** Preserva a página WhatsApp principal e fecha somente duplicatas excedentes. */
-async function keepSingleWhatsAppPage(pages: any[], preferred?: any): Promise<any | undefined> {
-  const whatsappPages = pages.filter((p: any) => {
-    try {
-      return String(p.url?.() || '').includes('web.whatsapp.com');
-    } catch {
-      return false;
-    }
-  });
-  const keep = preferred && whatsappPages.includes(preferred) ? preferred : whatsappPages[0];
-  for (const page of whatsappPages) {
-    if (page === keep || typeof page.close !== 'function') continue;
-    await page.close().catch(() => {});
-  }
-  return keep;
 }
