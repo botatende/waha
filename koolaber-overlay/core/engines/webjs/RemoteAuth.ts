@@ -392,7 +392,23 @@ export class RemoteAuth implements AuthStrategy {
       }
     };
 
-    await fs.copy(this.userDataDir, this.tempDir, { filter: skipSymlinks });
+    const COPY_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= COPY_ATTEMPTS; attempt++) {
+      await this.removePathSilently(this.tempDir);
+      try {
+        await fs.copy(this.userDataDir, this.tempDir, {
+          filter: skipSymlinks,
+        });
+        break;
+      } catch (error) {
+        const transient = (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+        if (!transient || attempt === COPY_ATTEMPTS) throw error;
+        this.logger.warn(
+          `RemoteAuth profile changed during backup; retrying snapshot (${attempt}/${COPY_ATTEMPTS})`,
+        );
+        await sleep(250 * attempt);
+      }
+    }
     await this.deleteMetadata();
 
     this.logger.debug('Compressing session...');
