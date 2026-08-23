@@ -160,38 +160,6 @@ export class RemoteAuth implements AuthStrategy {
    */
   private async removeSingletonFiles(dir: string) {
     const files = await fs.promises.readdir(dir);
-
-    const lockPath = path.join(dir, 'SingletonLock');
-    let lockTarget = '';
-    try {
-      lockTarget = await fs.promises.readlink(lockPath);
-    } catch {}
-
-    const pidMatch = lockTarget.match(/-(\d+)$/);
-    if (pidMatch) {
-      const pid = Number(pidMatch[1]);
-      try {
-        process.kill(pid, 0);
-        throw new Error(
-          `Chromium singleton belongs to active process ${pid}; refusing cleanup`,
-        );
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== 'ESRCH') throw error;
-      }
-    }
-
-    // Chromium keeps SingletonSocket as a symlink to a per-process directory
-    // under /tmp. Removing only the profile symlink leaves the stale socket and
-    // can make the next launch exit without mapping a browser window.
-    const socketLink = path.join(dir, 'SingletonSocket');
-    let socketTarget = '';
-    try {
-      socketTarget = await fs.promises.readlink(socketLink);
-      if (!path.isAbsolute(socketTarget)) {
-        socketTarget = path.resolve(dir, socketTarget);
-      }
-    } catch {}
-
     for (const file of files) {
       if (file.startsWith('Singleton')) {
         const filePath = path.join(dir, file);
@@ -205,13 +173,6 @@ export class RemoteAuth implements AuthStrategy {
           this.logger.error(err, `Error deleting: ${filePath}`);
         }
       }
-    }
-
-    if (socketTarget.startsWith('/tmp/org.chromium.Chromium.')) {
-      await fs.promises.rm(socketTarget, { force: true }).catch(() => {});
-      await fs.promises
-        .rmdir(path.dirname(socketTarget))
-        .catch(() => {});
     }
   }
 
@@ -260,16 +221,12 @@ export class RemoteAuth implements AuthStrategy {
   }
 
   async logout() {
-    // Keep the coordinator open until the logout-owned repository deletion
-    // finishes. Closing it first makes deleteRemoteSession/sessionExists reject
-    // with SessionOpClosed and turns a normal page logout into an unhandled
-    // session failure.
     this.backupSyncRunner.stop();
     if (this.coordinator) {
       await this.coordinator.drain();
     }
     try {
-      await this.disconnect(); // deleteRemoteSession still needs the coordinator
+      await this.disconnect(); // deleteRemoteSession precisa do coordinator aberto
     } finally {
       if (this.coordinator) {
         this.coordinator.beginClose();
@@ -319,7 +276,7 @@ export class RemoteAuth implements AuthStrategy {
     if (this.initialBackupPromise) {
       return this.initialBackupPromise;
     }
-    const backupPromise = (async () => {
+    this.initialBackupPromise = (async () => {
       // Retry com backoff exponencial, com LIMITE para nao travar o shutdown.
       // O runner periodico (60s) continua tentando depois; aqui nao fica em
       // loop infinito que seguraria SIGTERM/flush.
@@ -355,20 +312,12 @@ export class RemoteAuth implements AuthStrategy {
       );
       return false;
     })();
-    this.initialBackupPromise = backupPromise;
-    const persisted = await backupPromise;
-    if (!persisted && this.initialBackupPromise === backupPromise) {
-      this.initialBackupPromise = null;
-    }
-    return persisted;
+    return this.initialBackupPromise;
   }
 
   async afterAuthReady() {
     // Backup imediato (sem delay de 60s) — single-flight, aguarda conclusao.
-    const persisted = await this.ensureInitialBackup();
-    if (!persisted) {
-      throw new Error('RemoteAuth initial backup was not confirmed');
-    }
+    await this.ensureInitialBackup();
     this.client.emit(Events.REMOTE_SESSION_SAVED);
 
     this.backupSyncRunner.start(async () => {
@@ -393,7 +342,6 @@ export class RemoteAuth implements AuthStrategy {
     if (this.coordinator) {
       return this.coordinator.run(doBackup, { priority: 'low' }).catch((e) => {
         if ((e && e.message) !== 'SessionOpClosed') this.logger.error(e, 'backup sync error');
-        throw e;
       });
     }
     return doBackup();

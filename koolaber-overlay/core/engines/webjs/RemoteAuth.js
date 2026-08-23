@@ -96,33 +96,6 @@ class RemoteAuth {
     }
     async removeSingletonFiles(dir) {
         const files = await fs.promises.readdir(dir);
-        const lockPath = path.join(dir, 'SingletonLock');
-        let lockTarget = '';
-        try {
-            lockTarget = await fs.promises.readlink(lockPath);
-        }
-        catch (_a) { }
-        const pidMatch = lockTarget.match(/-(\d+)$/);
-        if (pidMatch) {
-            const pid = Number(pidMatch[1]);
-            try {
-                process.kill(pid, 0);
-                throw new Error(`Chromium singleton belongs to active process ${pid}; refusing cleanup`);
-            }
-            catch (error) {
-                if ((error === null || error === void 0 ? void 0 : error.code) !== 'ESRCH')
-                    throw error;
-            }
-        }
-        const socketLink = path.join(dir, 'SingletonSocket');
-        let socketTarget = '';
-        try {
-            socketTarget = await fs.promises.readlink(socketLink);
-            if (!path.isAbsolute(socketTarget)) {
-                socketTarget = path.resolve(dir, socketTarget);
-            }
-        }
-        catch (_b) { }
         for (const file of files) {
             if (file.startsWith('Singleton')) {
                 const filePath = path.join(dir, file);
@@ -137,10 +110,6 @@ class RemoteAuth {
                     this.logger.error(err, `Error deleting: ${filePath}`);
                 }
             }
-        }
-        if (socketTarget.startsWith('/tmp/org.chromium.Chromium.')) {
-            await fs.promises.rm(socketTarget, { force: true }).catch(() => { });
-            await fs.promises.rmdir(path.dirname(socketTarget)).catch(() => { });
         }
     }
     async syncData() {
@@ -180,10 +149,6 @@ class RemoteAuth {
         return this.closingPoolPromise;
     }
     async logout() {
-        // Keep the coordinator open until the logout-owned repository deletion
-        // finishes. Closing it first makes deleteRemoteSession/sessionExists reject
-        // with SessionOpClosed and turns a normal page logout into an unhandled
-        // session failure.
         this.backupSyncRunner.stop();
         if (this.coordinator) {
             await this.coordinator.drain();
@@ -221,7 +186,7 @@ class RemoteAuth {
         if (this.initialBackupPromise) {
             return this.initialBackupPromise;
         }
-        const backupPromise = (async () => {
+        this.initialBackupPromise = (async () => {
             const MAX_ATTEMPTS = 3;
             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
                 this.initialBackupAttempt = attempt;
@@ -247,18 +212,10 @@ class RemoteAuth {
             this.logger.error(`RemoteAuth: backup inicial nao confirmado apos ${MAX_ATTEMPTS} tentativas (runner 60s continuara)`);
             return false;
         })();
-        this.initialBackupPromise = backupPromise;
-        const persisted = await backupPromise;
-        if (!persisted && this.initialBackupPromise === backupPromise) {
-            this.initialBackupPromise = null;
-        }
-        return persisted;
+        return this.initialBackupPromise;
     }
     async afterAuthReady() {
-        const persisted = await this.ensureInitialBackup();
-        if (!persisted) {
-            throw new Error('RemoteAuth initial backup was not confirmed');
-        }
+        await this.ensureInitialBackup();
         this.client.emit(whatsapp_web_js_1.Events.REMOTE_SESSION_SAVED);
         this.backupSyncRunner.start(async () => {
             await this.storeRemoteSession();
@@ -282,7 +239,6 @@ class RemoteAuth {
             return this.coordinator.run(doBackup, { priority: 'low' }).catch((e) => {
                 if ((e && e.message) !== 'SessionOpClosed')
                     this.logger.error(e, 'backup sync error');
-                throw e;
             });
         }
         return doBackup();
