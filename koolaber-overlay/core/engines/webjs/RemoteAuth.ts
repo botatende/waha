@@ -246,7 +246,12 @@ export class RemoteAuth implements AuthStrategy {
       // Se o backup inicial ainda nao concluiu/confirmou, forca um flush agora.
       const FLUSH_TIMEOUT_MS = 10000; // < grace period (SIGTERM)
       await Promise.race([
-        this.ensureInitialBackup().catch(() => false),
+        this.storeRemoteSession().catch((e) => {
+          this.logger.warn(
+            `RemoteAuth.destroy backup final falhou: ${(e as Error).message}`,
+          );
+          return false;
+        }),
         new Promise((r) => setTimeout(r, FLUSH_TIMEOUT_MS)),
       ]);
       await this.drainRepositoryOperations();
@@ -276,7 +281,7 @@ export class RemoteAuth implements AuthStrategy {
     if (this.initialBackupPromise) {
       return this.initialBackupPromise;
     }
-    this.initialBackupPromise = (async () => {
+    const backupPromise = (async () => {
       // Retry com backoff exponencial, com LIMITE para nao travar o shutdown.
       // O runner periodico (60s) continua tentando depois; aqui nao fica em
       // loop infinito que seguraria SIGTERM/flush.
@@ -284,11 +289,8 @@ export class RemoteAuth implements AuthStrategy {
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         this.initialBackupAttempt = attempt;
         try {
-          await this.storeRemoteSession();
-          const exists = await this.store.sessionExists({
-            session: this.sessionName,
-          });
-          if (exists) {
+          const persisted = await this.storeRemoteSession();
+          if (persisted) {
             this.logger.info(
               `RemoteAuth: auth persistida confirmada (backup #${this.initialBackupAttempt})`,
             );
@@ -312,36 +314,68 @@ export class RemoteAuth implements AuthStrategy {
       );
       return false;
     })();
-    return this.initialBackupPromise;
+    this.initialBackupPromise = backupPromise;
+    const confirmed = await backupPromise;
+    if (!confirmed && this.initialBackupPromise === backupPromise) {
+      // Permite nova tentativa real em AUTHENTICATED/READY posteriores. Uma
+      // promessa resolvida como false nunca pode virar prova de persistencia.
+      this.initialBackupPromise = null;
+    }
+    return confirmed;
   }
 
   async afterAuthReady() {
     // Backup imediato (sem delay de 60s) — single-flight, aguarda conclusao.
-    await this.ensureInitialBackup();
-    this.client.emit(Events.REMOTE_SESSION_SAVED);
+    const persisted = await this.ensureInitialBackup();
+    if (persisted) {
+      this.client.emit(Events.REMOTE_SESSION_SAVED);
+    } else {
+      this.logger.error(
+        'RemoteAuth: REMOTE_SESSION_SAVED nao emitido; blob nao confirmado no store',
+      );
+    }
 
     this.backupSyncRunner.start(async () => {
-      await this.storeRemoteSession();
+      const periodicPersisted = await this.storeRemoteSession();
+      if (!periodicPersisted) {
+        this.logger.warn('RemoteAuth: backup periodico nao persistido');
+      }
     });
   }
 
-  async storeRemoteSession() {
+  async storeRemoteSession(): Promise<boolean> {
     // Backup periódico: baixa prioridade + cancelable pelo coordenador da sessão.
     const doBackup = async () => {
-      if (this.coordinator && this.coordinator.isClosing()) return;
+      if (this.coordinator && this.coordinator.isClosing()) return false;
       const pathExists = await isValidPath(this.userDataDir);
       if (!pathExists) {
         this.logger.warn('User data dir does not exist. Skipping session backup.');
-        return;
+        return false;
       }
-      await this.compressSession();
-      await this.store.save({ session: this.sessionName });
-      await this.removePathSilently(this.compressedSessionPath);
-      await this.removePathSilently(this.tempDir);
+      try {
+        await this.compressSession();
+        const zipSize = await getFilesizeInBytes(this.compressedSessionPath);
+        if (!zipSize) {
+          throw new Error('RemoteAuth archive is empty or missing');
+        }
+        await this.store.save({ session: this.sessionName });
+        const exists = await this.store.sessionExists({
+          session: this.sessionName,
+        });
+        if (!exists) {
+          throw new Error('RemoteAuth blob was not confirmed in the store');
+        }
+        return true;
+      } finally {
+        await this.removePathSilently(this.compressedSessionPath);
+        await this.removePathSilently(this.tempDir);
+      }
     };
     if (this.coordinator) {
       return this.coordinator.run(doBackup, { priority: 'low' }).catch((e) => {
-        if ((e && e.message) !== 'SessionOpClosed') this.logger.error(e, 'backup sync error');
+        if ((e && e.message) === 'SessionOpClosed') return false;
+        this.logger.error(e, 'backup sync error');
+        throw e;
       });
     }
     return doBackup();

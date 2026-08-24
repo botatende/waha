@@ -169,7 +169,10 @@ class RemoteAuth {
         try {
             const FLUSH_TIMEOUT_MS = 10000;
             await Promise.race([
-                this.ensureInitialBackup().catch(() => false),
+                this.storeRemoteSession().catch((e) => {
+                    this.logger.warn(`RemoteAuth.destroy backup final falhou: ${e.message}`);
+                    return false;
+                }),
                 new Promise((r) => setTimeout(r, FLUSH_TIMEOUT_MS)),
             ]);
             await this.drainRepositoryOperations();
@@ -186,16 +189,13 @@ class RemoteAuth {
         if (this.initialBackupPromise) {
             return this.initialBackupPromise;
         }
-        this.initialBackupPromise = (async () => {
+        const backupPromise = (async () => {
             const MAX_ATTEMPTS = 3;
             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
                 this.initialBackupAttempt = attempt;
                 try {
-                    await this.storeRemoteSession();
-                    const exists = await this.store.sessionExists({
-                        session: this.sessionName,
-                    });
-                    if (exists) {
+                    const persisted = await this.storeRemoteSession();
+                    if (persisted) {
                         this.logger.info(`RemoteAuth: auth persistida confirmada (backup #${this.initialBackupAttempt})`);
                         return true;
                     }
@@ -212,33 +212,63 @@ class RemoteAuth {
             this.logger.error(`RemoteAuth: backup inicial nao confirmado apos ${MAX_ATTEMPTS} tentativas (runner 60s continuara)`);
             return false;
         })();
-        return this.initialBackupPromise;
+        this.initialBackupPromise = backupPromise;
+        const confirmed = await backupPromise;
+        if (!confirmed && this.initialBackupPromise === backupPromise) {
+            this.initialBackupPromise = null;
+        }
+        return confirmed;
     }
     async afterAuthReady() {
-        await this.ensureInitialBackup();
-        this.client.emit(whatsapp_web_js_1.Events.REMOTE_SESSION_SAVED);
+        const persisted = await this.ensureInitialBackup();
+        if (persisted) {
+            this.client.emit(whatsapp_web_js_1.Events.REMOTE_SESSION_SAVED);
+        }
+        else {
+            this.logger.error('RemoteAuth: REMOTE_SESSION_SAVED nao emitido; blob nao confirmado no store');
+        }
         this.backupSyncRunner.start(async () => {
-            await this.storeRemoteSession();
+            const periodicPersisted = await this.storeRemoteSession();
+            if (!periodicPersisted) {
+                this.logger.warn('RemoteAuth: backup periodico nao persistido');
+            }
         });
     }
     async storeRemoteSession() {
         const doBackup = async () => {
             if (this.coordinator && this.coordinator.isClosing())
-                return;
+                return false;
             const pathExists = await isValidPath(this.userDataDir);
             if (!pathExists) {
                 this.logger.warn('User data dir does not exist. Skipping session backup.');
-                return;
+                return false;
             }
-            await this.compressSession();
-            await this.store.save({ session: this.sessionName });
-            await this.removePathSilently(this.compressedSessionPath);
-            await this.removePathSilently(this.tempDir);
+            try {
+                await this.compressSession();
+                const zipSize = await getFilesizeInBytes(this.compressedSessionPath);
+                if (!zipSize) {
+                    throw new Error('RemoteAuth archive is empty or missing');
+                }
+                await this.store.save({ session: this.sessionName });
+                const exists = await this.store.sessionExists({
+                    session: this.sessionName,
+                });
+                if (!exists) {
+                    throw new Error('RemoteAuth blob was not confirmed in the store');
+                }
+                return true;
+            }
+            finally {
+                await this.removePathSilently(this.compressedSessionPath);
+                await this.removePathSilently(this.tempDir);
+            }
         };
         if (this.coordinator) {
             return this.coordinator.run(doBackup, { priority: 'low' }).catch((e) => {
-                if ((e && e.message) !== 'SessionOpClosed')
-                    this.logger.error(e, 'backup sync error');
+                if ((e && e.message) === 'SessionOpClosed')
+                    return false;
+                this.logger.error(e, 'backup sync error');
+                throw e;
             });
         }
         return doBackup();
